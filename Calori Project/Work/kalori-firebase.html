@@ -1,0 +1,2337 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>كالوري — تتبع تغذيتك</title>
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;500;600;700;900&display=swap"
+    rel="stylesheet">
+
+  <!-- ██████████████████████████████████████████████
+     🔥 FIREBASE CONFIG — ضع مفاتيحك هنا
+     اتبع التعليمات الموجودة في نهاية الملف
+     ██████████████████████████████████████████████ -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+    import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile }
+      from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+    import { getFirestore, doc, getDoc, setDoc, updateDoc, collection, getDocs, onSnapshot }
+      from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+    // ╔══════════════════════════════════════════╗
+    // ║   ← ضع إعدادات Firebase هنا            ║
+    // ╚══════════════════════════════════════════╝
+    const firebaseConfig = {
+      apiKey: "AIzaSyApUReltiJyrTaXumwMgoNFglSk88FdSUY",
+      authDomain: "calori-c6c4d.firebaseapp.com",
+      projectId: "calori-c6c4d",
+      storageBucket: "calori-c6c4d.firebasestorage.app",
+      messagingSenderId: "1016235316270",
+      appId: "1:1016235316270:web:34494dafa9730efb663bbf",
+      measurementId: "G-8F70ZH74EV"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+
+    // ══════════════════════════════════════════
+    //  FIREBASE HELPERS
+    // ══════════════════════════════════════════
+
+    // داتا اليوزر الخاصة — users/{uid}/...
+    async function fbGetUserDoc(uid, docName) {
+      const snap = await getDoc(doc(db, 'users', uid, 'data', docName));
+      return snap.exists() ? snap.data() : null;
+    }
+    async function fbSetUserDoc(uid, docName, data) {
+      await setDoc(doc(db, 'users', uid, 'data', docName), data);
+    }
+
+    // المنتجات المشتركة — products/{barcode}
+    async function fbGetProduct(barcode) {
+      const snap = await getDoc(doc(db, 'products', barcode));
+      return snap.exists() ? snap.data() : null;
+    }
+    async function fbSaveProduct(barcode, data) {
+      await setDoc(doc(db, 'products', barcode), data);
+    }
+    async function fbGetAllProducts() {
+      const snap = await getDocs(collection(db, 'products'));
+      const result = {};
+      snap.forEach(d => result[d.id] = d.data());
+      return result;
+    }
+
+    // ══════════════════════════════════════════
+    //  STATE
+    // ══════════════════════════════════════════
+    let session = null; // { uid, name, email }
+    let currentDate = todayKey();
+    let currentMealIdx = 0;
+    let pendingAiFoods = [];
+    let pendingProduct = null;
+    let cachedLogs = {};
+    let cachedGoals = { cal: 2000, pro: 150, carb: 200, fat: 65 };
+    let cachedSavedMeals = [];
+    let cachedSavedFoods = [];
+
+    function todayKey() { return new Date().toISOString().slice(0, 10); }
+
+    // ══════════════════════════════════════════
+    //  AUTH STATE LISTENER
+    // ══════════════════════════════════════════
+    onAuthStateChanged(auth, async user => {
+      if (user) {
+        session = { uid: user.uid, name: user.displayName || user.email.split('@')[0], email: user.email };
+        await loadUserData();
+        enterApp();
+      } else {
+        session = null;
+        showAuthScreen();
+      }
+    });
+
+    async function loadUserData() {
+      const [logsDoc, goalsDoc, savedMealsDoc, savedFoodsDoc] = await Promise.all([
+        fbGetUserDoc(session.uid, 'logs'),
+        fbGetUserDoc(session.uid, 'goals'),
+        fbGetUserDoc(session.uid, 'savedMeals'),
+        fbGetUserDoc(session.uid, 'savedFoods'),
+      ]);
+      cachedLogs = logsDoc?.data || {};
+      cachedGoals = goalsDoc || { cal: 2000, pro: 150, carb: 200, fat: 65 };
+      cachedSavedMeals = savedMealsDoc?.list || [];
+      cachedSavedFoods = savedFoodsDoc?.list || [];
+    }
+
+    async function saveLogsToFb() { await fbSetUserDoc(session.uid, 'logs', { data: cachedLogs }); }
+    async function saveGoalsToFb() { await fbSetUserDoc(session.uid, 'goals', cachedGoals); }
+    async function saveSavedMealsToFb() { await fbSetUserDoc(session.uid, 'savedMeals', { list: cachedSavedMeals }); }
+    async function saveSavedFoodsToFb() { await fbSetUserDoc(session.uid, 'savedFoods', { list: cachedSavedFoods }); }
+
+    // ══════════════════════════════════════════
+    //  REGISTER / LOGIN / LOGOUT
+    // ══════════════════════════════════════════
+    window.doRegister = async function () {
+      clearAuthErr();
+      const ok1 = validateName();
+      const ok2 = validateEmailField();
+      const ok3 = validatePass();
+      const ok4 = validatePass2();
+      if (!ok1 || !ok2 || !ok3 || !ok4) { showAuthErr('يرجى تصحيح الأخطاء أعلاه'); return; }
+
+      const name = document.getElementById('regName').value.trim();
+      const email = document.getElementById('regEmail').value.trim();
+      const pass = document.getElementById('regPass').value;
+
+      setBtnLoading('regBtn', true);
+      try {
+        const cred = await createUserWithEmailAndPassword(auth, email, pass);
+        await updateProfile(cred.user, { displayName: name });
+        // onAuthStateChanged يتولى الباقي تلقائياً
+      } catch (e) {
+        setBtnLoading('regBtn', false);
+        if (e.code === 'auth/email-already-in-use') showAuthErr('هذا الإيميل مسجل مسبقاً');
+        else if (e.code === 'auth/weak-password') showAuthErr('كلمة المرور ضعيفة جداً');
+        else showAuthErr('حدث خطأ: ' + e.message);
+      }
+    }
+
+    window.doLogin = async function () {
+      clearAuthErr();
+      const email = document.getElementById('loginEmail').value.trim();
+      const pass = document.getElementById('loginPass').value;
+      if (!email || !pass) { showAuthErr('أدخل الإيميل وكلمة المرور'); return; }
+      if (!isValidEmail(email)) { showAuthErr('صيغة الإيميل غير صحيحة'); return; }
+
+      setBtnLoading('loginBtn', true);
+      try {
+        await signInWithEmailAndPassword(auth, email, pass);
+        // onAuthStateChanged يتولى الباقي
+      } catch (e) {
+        setBtnLoading('loginBtn', false);
+        if (e.code === 'auth/user-not-found' || e.code === 'auth/invalid-credential') showAuthErr('الإيميل أو كلمة المرور غير صحيحة');
+        else if (e.code === 'auth/wrong-password') showAuthErr('كلمة المرور غير صحيحة');
+        else if (e.code === 'auth/too-many-requests') showAuthErr('تم تجاوز عدد المحاولات، انتظر قليلاً');
+        else showAuthErr('حدث خطأ: ' + e.message);
+      }
+    }
+
+    window.doLogout = async function () {
+      await signOut(auth);
+      showToast('👋 تم تسجيل الخروج');
+    }
+
+    // ══════════════════════════════════════════
+    //  DATA HELPERS
+    // ══════════════════════════════════════════
+    function getDayMeals(date) {
+      if (!cachedLogs[date]) {
+        cachedLogs[date] = [
+          { name: 'الإفطار', icon: '🌅', items: [] },
+          { name: 'الغداء', icon: '☀️', items: [] },
+          { name: 'العشاء', icon: '🌙', items: [] },
+          { name: 'سناك', icon: '🍎', items: [] },
+        ];
+      }
+      return cachedLogs[date];
+    }
+    async function saveMeals(date, meals) {
+      cachedLogs[date] = meals;
+      await saveLogsToFb();
+    }
+    function getTotals(date) {
+      const meals = cachedLogs[date] || [];
+      let cal = 0, pro = 0, carb = 0, fat = 0;
+      meals.forEach(m => m.items.forEach(i => { cal += i.cal || 0; pro += i.pro || 0; carb += i.carb || 0; fat += i.fat || 0 }));
+      return { cal: Math.round(cal), pro: Math.round(pro), carb: Math.round(carb), fat: Math.round(fat) };
+    }
+    async function pushSavedFood(food) {
+      if (!cachedSavedFoods.find(f => f.name === food.name)) {
+        cachedSavedFoods.push(food);
+        await saveSavedFoodsToFb();
+      }
+    }
+
+    // ══════════════════════════════════════════
+    //  UI INIT
+    // ══════════════════════════════════════════
+    function showAuthScreen() {
+      document.getElementById('authScreen').classList.remove('hide');
+      document.getElementById('appScreen').classList.add('hide');
+      document.getElementById('loadingScreen').classList.add('hide');
+    }
+
+    function enterApp() {
+      document.getElementById('loadingScreen').classList.add('hide');
+      document.getElementById('authScreen').classList.add('hide');
+      document.getElementById('appScreen').classList.remove('hide');
+      const ava = session.name.charAt(0).toUpperCase();
+      ['userAva', 'profileAva'].forEach(id => document.getElementById(id).textContent = ava);
+      document.getElementById('userNameBadge').textContent = session.name.split(' ')[0];
+      document.getElementById('profileName').textContent = session.name;
+      document.getElementById('profileEmail').textContent = session.email;
+      currentDate = todayKey();
+      getDayMeals(currentDate);
+      renderHome();
+      loadGoalsUI();
+      setBtnLoading('loginBtn', false);
+      setBtnLoading('regBtn', false);
+    }
+
+    // ══════════════════════════════════════════
+    //  NAVIGATION
+    // ══════════════════════════════════════════
+    window.showPage = function (id, btn) {
+      document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+      document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+      document.getElementById('page-' + id).classList.add('active');
+      if (btn) btn.classList.add('active');
+      if (id === 'history') renderHistory();
+      if (id === 'saved') renderSavedMeals();
+      if (id === 'scan') renderSharedProducts();
+      if (id === 'profile') loadGoalsUI();
+    }
+
+    // ══════════════════════════════════════════
+    //  DATE
+    // ══════════════════════════════════════════
+    window.switchDate = function (d) {
+      if (!d) return;
+      currentDate = d;
+      closeModal('dateModal');
+      updateDateBadge();
+      renderHome();
+    }
+    function updateDateBadge() {
+      const b = document.getElementById('dateBadge');
+      b.textContent = currentDate === todayKey() ? '📅 اليوم' : '📅 ' + new Date(currentDate).toLocaleDateString('ar-SA', { month: 'short', day: 'numeric' });
+    }
+
+    // ══════════════════════════════════════════
+    //  HOME
+    // ══════════════════════════════════════════
+    function renderHome() {
+      updateDateBadge();
+      renderRing();
+      renderMeals();
+    }
+    function renderRing() {
+      const t = getTotals(currentDate), g = cachedGoals;
+      const pct = Math.min(1, t.cal / g.cal);
+      document.getElementById('ringFill').style.strokeDashoffset = 251.2 - (251.2 * pct);
+      document.getElementById('ringCal').textContent = t.cal;
+      document.getElementById('goalTxt').textContent = g.cal;
+      const remaining = Math.max(0, g.cal - t.cal);
+      document.getElementById('remainingTxt').textContent = remaining + ' متبقية';
+      const macros = [
+        { name: 'بروتين', val: t.pro, goal: g.pro, color: 'var(--protein)' },
+        { name: 'كربوهيدرات', val: t.carb, goal: g.carb, color: 'var(--carbs)' },
+        { name: 'دهون', val: t.fat, goal: g.fat, color: 'var(--fat)' },
+      ];
+      document.getElementById('macroList').innerHTML = macros.map(m => {
+        const p = Math.min(100, Math.round((m.val / m.goal) * 100));
+        return `<div class="macro-item"><div class="mdot" style="background:${m.color}"></div><div class="mname">${m.name}</div><div class="mval" style="color:${m.color}">${m.val}g</div></div>
+    <div class="mbar"><div class="mbar-fill" style="width:${p}%;background:${m.color}"></div></div>`;
+      }).join('');
+    }
+    function renderMeals() {
+      const meals = getDayMeals(currentDate);
+      const cont = document.getElementById('mealSections');
+      cont.innerHTML = meals.map((meal, mi) => {
+        const total = meal.items.reduce((s, i) => s + (i.cal || 0), 0);
+        const items = meal.items.map((item, ii) => `
+      <div class="meal-item">
+        <div class="mi-name">${item.name}</div>
+        <div class="mi-g">${item.grams ? item.grams + 'g' : ''}</div>
+        <div class="mi-cal">${item.cal} kcal</div>
+        <button class="mi-del" onclick="deleteFood(${mi},${ii})">🗑</button>
+      </div>`).join('');
+        return `<div class="meal-sec open" id="msec-${mi}">
+      <div class="meal-head" onclick="toggleMeal(${mi})">
+        <div class="meal-icon">${meal.icon || '🍽️'}</div>
+        <div class="meal-title">${meal.name}</div>
+        <div class="meal-kcal">${Math.round(total)} kcal</div>
+        <div class="meal-chev">▾</div>
+      </div>
+      <div class="meal-items">${items.length ? items : '<div class="meal-empty">لا يوجد طعام</div>'}</div>
+      <div class="add-food-row" onclick="openAddFood(${mi})">＋ إضافة طعام</div>
+      <div class="save-meal-row" onclick="saveMealTemplate(${mi})">⭐ حفظ هذه الوجبة</div>
+    </div>`;
+      }).join('');
+    }
+    window.toggleMeal = mi => document.getElementById('msec-' + mi)?.classList.toggle('open');
+    window.addMealSection = async function () {
+      const meals = getDayMeals(currentDate);
+      const extras = [{ name: 'وجبة إضافية', icon: '🍽️' }, { name: 'سناك', icon: '🥗' }, { name: 'قبل النوم', icon: '🌛' }, { name: 'عصير', icon: '🥤' }];
+      const e = extras[meals.length % extras.length];
+      meals.push({ ...e, items: [] });
+      await saveMeals(currentDate, meals);
+      renderHome();
+    }
+    window.deleteFood = async function (mi, ii) {
+      const meals = getDayMeals(currentDate);
+      meals[mi].items.splice(ii, 1);
+      await saveMeals(currentDate, meals);
+      renderHome();
+    }
+
+    // ══════════════════════════════════════════
+    //  ADD FOOD MODAL
+    // ══════════════════════════════════════════
+    window.openAddFood = function (mi) {
+      currentMealIdx = mi;
+      const meal = getDayMeals(currentDate)[mi];
+      document.getElementById('addFoodMealLbl').textContent = meal.name;
+      document.getElementById('aiInput').value = '';
+      document.getElementById('aiResult').classList.remove('show');
+      document.getElementById('aiLoading').style.display = 'none';
+      pendingAiFoods = [];
+      switchTab('ai');
+      renderSavedFoodsModal();
+      openModal('addFoodModal');
+    }
+    window.switchTab = function (tab) {
+      const tabs = ['ai', 'manual', 'sfood'];
+      document.querySelectorAll('.tab-btn').forEach((b, i) => b.classList.toggle('active', tabs[i] === tab));
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+      document.getElementById('tab-' + tab).classList.add('active');
+    }
+
+    // ══════════════════════════════════════════
+    //  AI ANALYSIS
+    // ══════════════════════════════════════════
+    window.analyzeFood = async function () {
+      const text = document.getElementById('aiInput').value.trim();
+      if (!text) { showToast('اكتب اللي أكلته'); return; }
+      document.getElementById('aiLoading').style.display = 'flex';
+      document.getElementById('aiResult').classList.remove('show');
+      document.getElementById('aiBtn').disabled = true;
+      pendingAiFoods = [];
+      try {
+        const r = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'claude-sonnet-4-20250514', max_tokens: 1000,
+            system: `أنت خبير تغذية. رد بـ JSON فقط بدون أي نص آخر أو backticks:
+{"foods":[{"name":"اسم","grams":100,"cal":200,"pro":15,"carb":20,"fat":8}]}`,
+            messages: [{ role: 'user', content: text }]
+          })
+        });
+        const d = await r.json();
+        let raw = d.content.map(c => c.text || '').join('').replace(/```json|```/g, '').trim();
+        pendingAiFoods = JSON.parse(raw).foods;
+        renderAiResult(pendingAiFoods);
+      } catch (e) { showToast('حدث خطأ، جرب مرة أخرى'); }
+      finally { document.getElementById('aiLoading').style.display = 'none'; document.getElementById('aiBtn').disabled = false; }
+    }
+    function renderAiResult(foods) {
+      if (!foods?.length) { showToast('لم أتمكن من التحليل'); return; }
+      const total = foods.reduce((s, f) => s + (f.cal || 0), 0);
+      document.getElementById('aiResult').innerHTML = `
+    <div class="ai-result-title">✨ نتيجة التحليل</div>
+    ${foods.map(f => `<div class="ai-food-item">
+      <div><div class="ai-fname">${f.name}</div><div class="ai-fgrams">${f.grams || 100}g</div></div>
+      <div class="ai-macros"><span class="c">🔥${f.cal}</span><span class="p">🥩${f.pro}g</span><span class="cb">🍞${f.carb}g</span><span class="f">🧈${f.fat}g</span></div>
+    </div>`).join('')}
+    <div style="border-top:1px solid var(--surface3);padding-top:8px;margin-top:6px;display:flex;justify-content:space-between;font-size:13px">
+      <span style="color:var(--text2)">المجموع</span><span style="color:var(--cal);font-weight:900">${total} سعرة</span>
+    </div>
+    <button class="btn btn-primary btn-full" style="margin-top:11px" onclick="confirmAiFoods()">➕ إضافة للوجبة</button>`;
+      document.getElementById('aiResult').classList.add('show');
+    }
+    window.confirmAiFoods = async function () {
+      const meals = getDayMeals(currentDate);
+      for (const f of pendingAiFoods) { meals[currentMealIdx].items.push(f); await pushSavedFood(f); }
+      await saveMeals(currentDate, meals);
+      renderHome(); closeModal('addFoodModal');
+      showToast(`✅ أُضيف ${pendingAiFoods.length} عنصر`);
+    }
+    window.addManualFood = async function () {
+      const name = document.getElementById('mName').value.trim();
+      if (!name) { showToast('أدخل اسم الطعام'); return; }
+      const food = { name, grams: +document.getElementById('mGrams').value || 0, cal: +document.getElementById('mCal').value || 0, pro: +document.getElementById('mPro').value || 0, carb: +document.getElementById('mCarb').value || 0, fat: +document.getElementById('mFat').value || 0 };
+      const meals = getDayMeals(currentDate);
+      meals[currentMealIdx].items.push(food);
+      await saveMeals(currentDate, meals);
+      await pushSavedFood(food);
+      renderHome(); closeModal('addFoodModal');
+      showToast('✅ تمت الإضافة');
+    }
+    function renderSavedFoodsModal() {
+      const cont = document.getElementById('savedFoodsModal');
+      if (!cachedSavedFoods.length) { cont.innerHTML = '<div class="empty"><div class="empty-icon">⭐</div><div class="empty-text">لا توجد أطعمة محفوظة بعد</div></div>'; return; }
+      cont.innerHTML = cachedSavedFoods.map((f, i) => `
+    <div class="saved-item" onclick="addSavedFood(${i})">
+      <div><div class="si-name">${f.name}</div><div class="si-sub">${f.grams || 100}g</div></div>
+      <div class="si-cal">${f.cal} kcal</div>
+    </div>`).join('');
+    }
+    window.addSavedFood = async function (i) {
+      const food = cachedSavedFoods[i]; if (!food) return;
+      const meals = getDayMeals(currentDate);
+      meals[currentMealIdx].items.push({ ...food });
+      await saveMeals(currentDate, meals);
+      renderHome(); closeModal('addFoodModal');
+      showToast(`✅ أُضيف: ${food.name}`);
+    }
+
+    // ══════════════════════════════════════════
+    //  SAVE MEAL TEMPLATE
+    // ══════════════════════════════════════════
+    window.saveMealTemplate = async function (mi) {
+      const meal = getDayMeals(currentDate)[mi];
+      if (!meal.items.length) { showToast('الوجبة فارغة'); return; }
+      cachedSavedMeals.push({ name: meal.name, icon: meal.icon, items: [...meal.items], savedAt: new Date().toISOString() });
+      await saveSavedMealsToFb();
+      showToast('⭐ تم حفظ الوجبة');
+    }
+    function renderSavedMeals() {
+      const cont = document.getElementById('savedMealsList');
+      const empty = document.getElementById('savedEmpty');
+      if (!cachedSavedMeals.length) { cont.innerHTML = ''; empty.style.display = 'block'; return; }
+      empty.style.display = 'none';
+      cont.innerHTML = cachedSavedMeals.map((m, i) => {
+        const cal = m.items.reduce((s, f) => s + (f.cal || 0), 0);
+        return `<div class="saved-item" style="flex-wrap:wrap;gap:8px">
+      <div style="font-size:22px">${m.icon || '🍽️'}</div>
+      <div style="flex:1"><div class="si-name">${m.name}</div><div class="si-sub">${m.items.map(f => f.name).join(' · ')}</div></div>
+      <div style="display:flex;align-items:center;gap:7px">
+        <div class="si-cal">${Math.round(cal)} kcal</div>
+        <button class="btn btn-ghost" style="padding:5px 10px;font-size:12px" onclick="useSavedMeal(${i})">استخدام</button>
+        <button class="btn btn-danger" style="padding:5px 10px;font-size:12px" onclick="deleteSavedMeal(${i})">🗑</button>
+      </div>
+    </div>`;
+      }).join('');
+    }
+    window.useSavedMeal = async function (i) {
+      const m = cachedSavedMeals[i];
+      const meals = getDayMeals(currentDate);
+      meals.push({ name: m.name, icon: m.icon, items: m.items.map(f => ({ ...f })) });
+      await saveMeals(currentDate, meals);
+      renderHome(); showToast(`✅ أُضيفت: ${m.name}`);
+    }
+    window.deleteSavedMeal = async function (i) {
+      cachedSavedMeals.splice(i, 1);
+      await saveSavedMealsToFb();
+      renderSavedMeals();
+    }
+
+    // ══════════════════════════════════════════
+    //  SCAN — SHARED PRODUCTS (Firestore)
+    // ══════════════════════════════════════════
+    window.handleBarcodePhoto = async function (e) {
+      const file = e.target.files[0]; if (!file) return; e.target.value = '';
+      // محاكاة قراءة الباركود من الصورة
+      const bc = 'BC' + ((file.size * 31 + file.name.length * 17) % 900000 + 100000);
+      showToast('🔍 جاري البحث...');
+      const existing = await fbGetProduct(bc);
+      if (existing) {
+        pendingProduct = { ...existing, barcode: bc };
+        showProductCard(pendingProduct);
+        showToast('📦 منتج موجود في قاعدة البيانات المشتركة!');
+      } else {
+        showToast('🆕 منتج جديد — جاري التعرف عليه...');
+        await identifyProductFromImage(file, bc);
+      }
+    }
+    window.handleNutritionPhoto = async function (e) {
+      const file = e.target.files[0]; if (!file) return; e.target.value = '';
+      showToast('📸 جاري قراءة الجدول الغذائي...');
+      await readNutritionTable(file);
+    }
+    async function readNutritionTable(file) {
+      const b64 = await toBase64(file);
+      try {
+        const r = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'claude-sonnet-4-20250514', max_tokens: 800,
+            system: 'اقرأ جدول القيم الغذائية. رد بـ JSON فقط:\n{"name":"اسم","brand":"ماركة","per100g":{"cal":0,"pro":0,"carb":0,"fat":0}}',
+            messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: file.type || 'image/jpeg', data: b64 } }, { type: 'text', text: 'اقرأ جدول القيم الغذائية' }] }]
+          })
+        });
+        const d = await r.json();
+        let raw = d.content.map(c => c.text || '').join('').replace(/```json|```/g, '').trim();
+        pendingProduct = { ...JSON.parse(raw), barcode: null };
+        showProductCard(pendingProduct);
+      } catch (e) { showToast('لم أتمكن من قراءة الجدول'); }
+    }
+    async function identifyProductFromImage(file, barcode) {
+      const b64 = await toBase64(file);
+      try {
+        const r = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'claude-sonnet-4-20250514', max_tokens: 800,
+            system: 'عرّف المنتج وقيمه الغذائية. رد بـ JSON فقط:\n{"name":"اسم","brand":"ماركة","per100g":{"cal":0,"pro":0,"carb":0,"fat":0}}',
+            messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: file.type || 'image/jpeg', data: b64 } }, { type: 'text', text: 'ما هذا المنتج؟' }] }]
+          })
+        });
+        const d = await r.json();
+        let raw = d.content.map(c => c.text || '').join('').replace(/```json|```/g, '').trim();
+        pendingProduct = { ...JSON.parse(raw), barcode };
+        showProductCard(pendingProduct);
+      } catch (e) { showToast('لم أتمكن من التعرف على المنتج'); }
+    }
+    function showProductCard(p) {
+      document.getElementById('prodName').textContent = p.name || 'منتج';
+      document.getElementById('prodBrand').textContent = p.brand || '';
+      const g = p.per100g || {};
+      document.getElementById('nutrGrid').innerHTML = `
+    <div class="nutr-item"><div class="nutr-lbl">🔥 سعرات</div><div class="nutr-val" style="color:var(--cal)">${g.cal || 0}</div><div class="nutr-unit">/ 100g</div></div>
+    <div class="nutr-item"><div class="nutr-lbl">🥩 بروتين</div><div class="nutr-val" style="color:var(--protein)">${g.pro || 0}g</div><div class="nutr-unit">/ 100g</div></div>
+    <div class="nutr-item"><div class="nutr-lbl">🍞 كربوهيدرات</div><div class="nutr-val" style="color:var(--carbs)">${g.carb || 0}g</div><div class="nutr-unit">/ 100g</div></div>
+    <div class="nutr-item"><div class="nutr-lbl">🧈 دهون</div><div class="nutr-val" style="color:var(--fat)">${g.fat || 0}g</div><div class="nutr-unit">/ 100g</div></div>`;
+      document.getElementById('productCard').classList.add('show');
+    }
+    window.saveSharedProduct = async function () {
+      if (!pendingProduct?.barcode) { showToast('لا يوجد باركود'); return; }
+      await fbSaveProduct(pendingProduct.barcode, { name: pendingProduct.name, brand: pendingProduct.brand, per100g: pendingProduct.per100g });
+      renderSharedProducts();
+      showToast('🌍 تم الحفظ — سيظهر لجميع المستخدمين الآن');
+    }
+    window.addProductToMeal = async function () {
+      if (!pendingProduct) return;
+      const g = pendingProduct.per100g || {};
+      const food = { name: pendingProduct.name, grams: 100, cal: g.cal || 0, pro: g.pro || 0, carb: g.carb || 0, fat: g.fat || 0 };
+      const meals = getDayMeals(currentDate);
+      meals[meals.length - 1].items.push(food);
+      await saveMeals(currentDate, meals);
+      await pushSavedFood(food);
+      renderHome(); showToast('✅ أُضيف للوجبة');
+    }
+    async function renderSharedProducts() {
+      const cont = document.getElementById('sharedProductsList');
+      cont.innerHTML = '<div class="loading"><div class="spinner"></div>جاري التحميل...</div>';
+      const products = await fbGetAllProducts();
+      const keys = Object.keys(products);
+      if (!keys.length) { cont.innerHTML = '<div class="empty"><div class="empty-icon">📦</div><div class="empty-text">لا توجد منتجات محفوظة بعد</div></div>'; return; }
+      cont.innerHTML = keys.map(k => {
+        const p = products[k]; const g = p.per100g || {};
+        return `<div class="saved-item" onclick="selectSharedProduct('${k}')">
+      <div style="flex:1"><div class="si-name">${p.name}</div><div class="si-sub">${p.brand || ''}</div></div>
+      <div class="si-cal">${g.cal || 0} kcal/100g</div>
+    </div>`;
+      }).join('');
+    }
+    window.selectSharedProduct = async function (k) {
+      const products = await fbGetAllProducts();
+      pendingProduct = { ...products[k], barcode: k };
+      showProductCard(pendingProduct);
+      showToast('📦 ' + pendingProduct.name);
+    }
+
+    // ══════════════════════════════════════════
+    //  HISTORY
+    // ══════════════════════════════════════════
+    function renderHistory() {
+      const cont = document.getElementById('historyList');
+      const keys = Object.keys(cachedLogs).sort((a, b) => b.localeCompare(a));
+      if (!keys.length) { cont.innerHTML = '<div class="empty"><div class="empty-icon">📊</div><div class="empty-text">لا يوجد سجل بعد</div></div>'; return; }
+      cont.innerHTML = keys.map(date => {
+        const t = getTotals(date);
+        const mealNames = (cachedLogs[date] || []).filter(m => m.items.length).map(m => m.name).join(' · ');
+        return `<div class="day-card" onclick="goToDate('${date}')">
+      <div class="day-head"><div class="day-date">${formatDate(date)}</div><div class="day-cal-badge">🔥 ${t.cal} kcal</div></div>
+      <div class="day-meals-list">${mealNames || 'لا توجد وجبات'}</div>
+      <div class="day-macros">
+        <div class="dm" style="color:var(--protein)">🥩 <strong>${t.pro}g</strong></div>
+        <div class="dm" style="color:var(--carbs)">🍞 <strong>${t.carb}g</strong></div>
+        <div class="dm" style="color:var(--fat)">🧈 <strong>${t.fat}g</strong></div>
+      </div>
+    </div>`;
+      }).join('');
+    }
+    window.goToDate = function (date) {
+      currentDate = date;
+      document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+      document.querySelectorAll('.nav-btn').forEach((b, i) => b.classList.toggle('active', i === 0));
+      document.getElementById('page-home').classList.add('active');
+      renderHome();
+    }
+
+    // ══════════════════════════════════════════
+    //  GOALS
+    // ══════════════════════════════════════════
+    function loadGoalsUI() {
+      document.getElementById('calGS').value = cachedGoals.cal; document.getElementById('calGV').textContent = cachedGoals.cal;
+      document.getElementById('proGS').value = cachedGoals.pro; document.getElementById('proGV').textContent = cachedGoals.pro;
+      document.getElementById('carbGS').value = cachedGoals.carb; document.getElementById('carbGV').textContent = cachedGoals.carb;
+      document.getElementById('fatGS').value = cachedGoals.fat; document.getElementById('fatGV').textContent = cachedGoals.fat;
+    }
+    window.ugGoal = function (type) {
+      const map = { cal: 'calGS', pro: 'proGS', carb: 'carbGS', fat: 'fatGS' };
+      const vmap = { cal: 'calGV', pro: 'proGV', carb: 'carbGV', fat: 'fatGV' };
+      document.getElementById(vmap[type]).textContent = document.getElementById(map[type]).value;
+    }
+    window.saveGoals = async function () {
+      cachedGoals = { cal: +document.getElementById('calGS').value, pro: +document.getElementById('proGS').value, carb: +document.getElementById('carbGS').value, fat: +document.getElementById('fatGS').value };
+      await saveGoalsToFb();
+      renderHome(); showToast('✅ تم حفظ الأهداف');
+    }
+
+    // ══════════════════════════════════════════
+    //  AUTH VALIDATION
+    // ══════════════════════════════════════════
+    window.switchAuthTab = function (tab) {
+      document.querySelectorAll('.auth-tab').forEach((b, i) => b.classList.toggle('active', (i === 0 && tab === 'login') || (i === 1 && tab === 'register')));
+      document.getElementById('loginForm').style.display = tab === 'login' ? 'block' : 'none';
+      document.getElementById('registerForm').style.display = tab === 'register' ? 'block' : 'none';
+      clearAuthErr();
+    }
+    function clearAuthErr() { const e = document.getElementById('authErr'); e.classList.remove('show'); e.textContent = ''; }
+    window.clearAuthErr = clearAuthErr;
+    function showAuthErr(msg) { const e = document.getElementById('authErr'); e.textContent = msg; e.classList.add('show'); }
+    function isValidEmail(email) { return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email.trim()); }
+    function getPassStrength(pass) {
+      let s = 0;
+      if (pass.length >= 8) s++; if (pass.length >= 12) s++;
+      if (/[A-Z]/.test(pass)) s++; if (/[0-9]/.test(pass)) s++; if (/[^A-Za-z0-9]/.test(pass)) s++;
+      return s;
+    }
+    window.validateName = function () {
+      const v = document.getElementById('regName').value.trim();
+      const h = document.getElementById('regNameHint'), i = document.getElementById('regName');
+      if (!v) { h.textContent = ''; i.className = 'form-input'; return false }
+      if (v.length < 2) { h.textContent = 'الاسم قصير جداً'; h.className = 'field-hint err'; i.className = 'form-input error'; return false }
+      h.textContent = '✓'; h.className = 'field-hint ok'; i.className = 'form-input ok'; return true;
+    }
+    window.validateEmailField = function () {
+      const v = document.getElementById('regEmail').value.trim();
+      const h = document.getElementById('regEmailHint'), i = document.getElementById('regEmail');
+      if (!v) { h.textContent = ''; i.className = 'form-input'; return false }
+      if (!isValidEmail(v)) { h.textContent = 'صيغة الإيميل غير صحيحة'; h.className = 'field-hint err'; i.className = 'form-input error'; return false }
+      h.textContent = '✓ إيميل صحيح'; h.className = 'field-hint ok'; i.className = 'form-input ok'; return true;
+    }
+    window.validatePass = function () {
+      const v = document.getElementById('regPass').value;
+      const h = document.getElementById('regPassHint'), i = document.getElementById('regPass');
+      const bar = document.getElementById('passStrengthBar');
+      if (!v) { h.textContent = ''; i.className = 'form-input'; bar.style.width = '0'; return false }
+      const score = getPassStrength(v);
+      const colors = ['#f06060', '#f09060', '#f0c060', '#a0f060', '#60f0a0'];
+      const labels = ['ضعيفة جداً', 'ضعيفة', 'متوسطة', 'قوية', 'قوية جداً'];
+      bar.style.width = (score / 5 * 100) + '%'; bar.style.background = colors[score - 1] || colors[0];
+      if (v.length < 8) { h.textContent = '8 أحرف على الأقل'; h.className = 'field-hint err'; i.className = 'form-input error'; return false }
+      h.textContent = 'قوة المرور: ' + labels[score - 1]; h.className = score >= 3 ? 'field-hint ok' : 'field-hint err'; i.className = score >= 3 ? 'form-input ok' : 'form-input error';
+      window.validatePass2?.(); return score >= 2;
+    }
+    window.validatePass2 = function () {
+      const v = document.getElementById('regPass2').value, p1 = document.getElementById('regPass').value;
+      const h = document.getElementById('regPass2Hint'), i = document.getElementById('regPass2');
+      if (!v) { h.textContent = ''; i.className = 'form-input'; return false }
+      if (v !== p1) { h.textContent = 'كلمتا المرور غير متطابقتين'; h.className = 'field-hint err'; i.className = 'form-input error'; return false }
+      h.textContent = '✓ متطابقتان'; h.className = 'field-hint ok'; i.className = 'form-input ok'; return true;
+    }
+    window.togglePass = function (id, btn) {
+      const inp = document.getElementById(id);
+      inp.type = inp.type === 'password' ? 'text' : 'password'; btn.textContent = inp.type === 'password' ? '👁' : '🙈';
+    }
+
+    // ══════════════════════════════════════════
+    //  UTILS
+    // ══════════════════════════════════════════
+    function setBtnLoading(id, loading) {
+      const btn = document.getElementById(id);
+      if (!btn) return;
+      btn.disabled = loading;
+      if (loading) { btn.dataset.orig = btn.textContent; btn.innerHTML = '<div class="spinner" style="border-top-color:var(--bg)"></div>'; }
+      else btn.textContent = btn.dataset.orig || btn.textContent;
+    }
+    function formatDate(d) { return new Date(d).toLocaleDateString('ar-SA', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }); }
+    function showToast(msg) {
+      const t = document.getElementById('toast');
+      t.textContent = msg; t.classList.add('show');
+      setTimeout(() => t.classList.remove('show'), 2600);
+    }
+    function toBase64(file) {
+      return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result.split(',')[1]); r.onerror = rej; r.readAsDataURL(file) });
+    }
+    window.openModal = id => document.getElementById(id).classList.add('open');
+    window.closeModal = id => document.getElementById(id).classList.remove('open');
+    document.addEventListener('DOMContentLoaded', () => {
+      document.querySelectorAll('.overlay').forEach(o => o.addEventListener('click', e => { if (e.target === o) o.classList.remove('open') }));
+      document.getElementById('dateInput').value = todayKey();
+    });
+
+  </script>
+
+  <style>
+    :root {
+      --bg: #080810;
+      --surface: #10101c;
+      --surface2: #18182a;
+      --surface3: #222238;
+      --surface4: #2c2c48;
+      --accent: #b8f060;
+      --accent2: #60d4f0;
+      --accent3: #f060b8;
+      --text: #eeeef8;
+      --text2: #8888b0;
+      --text3: #44446a;
+      --protein: #f0a060;
+      --carbs: #60d4f0;
+      --fat: #f060b8;
+      --cal: #b8f060;
+      --r: 16px;
+      --rs: 10px;
+      --err: #f06060;
+      --ok: #60f0a0
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box
+    }
+
+    body {
+      font-family: 'Cairo', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden
+    }
+
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(184, 240, 96, 0.06), transparent);
+      pointer-events: none;
+      z-index: 0
+    }
+
+    /* SCREENS */
+    .screen {
+      position: fixed;
+      inset: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg);
+      transition: opacity .3s
+    }
+
+    .screen.hide {
+      opacity: 0;
+      pointer-events: none
+    }
+
+    #loadingScreen {
+      flex-direction: column;
+      gap: 16px
+    }
+
+    .loading-logo {
+      font-size: 42px;
+      font-weight: 900;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent
+    }
+
+    .loading-spin {
+      width: 32px;
+      height: 32px;
+      border: 3px solid var(--surface3);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .8s linear infinite
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg)
+      }
+    }
+
+    /* AUTH */
+    .auth-wrap {
+      width: 100%;
+      max-width: 400px;
+      padding: 24px;
+      position: relative;
+      z-index: 1
+    }
+
+    .auth-logo {
+      text-align: center;
+      margin-bottom: 28px
+    }
+
+    .auth-logo-text {
+      font-size: 38px;
+      font-weight: 900;
+      letter-spacing: -2px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent
+    }
+
+    .auth-logo-sub {
+      font-size: 12px;
+      color: var(--text3);
+      margin-top: 4px
+    }
+
+    .auth-card {
+      background: var(--surface);
+      border: 1px solid var(--surface3);
+      border-radius: 20px;
+      padding: 26px;
+      box-shadow: 0 24px 60px rgba(0, 0, 0, .5)
+    }
+
+    .auth-tabs {
+      display: flex;
+      gap: 4px;
+      background: var(--surface2);
+      padding: 4px;
+      border-radius: var(--rs);
+      margin-bottom: 22px
+    }
+
+    .auth-tab {
+      flex: 1;
+      padding: 9px;
+      border: none;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--text2);
+      font-family: 'Cairo', sans-serif;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all .15s
+    }
+
+    .auth-tab.active {
+      background: var(--accent);
+      color: var(--bg)
+    }
+
+    .form-group {
+      margin-bottom: 13px
+    }
+
+    .form-label {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text2);
+      margin-bottom: 5px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between
+    }
+
+    .form-input {
+      width: 100%;
+      background: var(--surface2);
+      border: 1.5px solid var(--surface3);
+      color: var(--text);
+      font-family: 'Cairo', sans-serif;
+      font-size: 15px;
+      padding: 11px 13px;
+      border-radius: var(--rs);
+      outline: none;
+      transition: border-color .2s
+    }
+
+    .form-input:focus {
+      border-color: var(--accent)
+    }
+
+    .form-input.error {
+      border-color: var(--err) !important
+    }
+
+    .form-input.ok {
+      border-color: var(--ok) !important
+    }
+
+    .field-hint {
+      font-size: 11px;
+      margin-top: 4px;
+      min-height: 15px
+    }
+
+    .field-hint.err {
+      color: var(--err)
+    }
+
+    .field-hint.ok {
+      color: var(--ok)
+    }
+
+    .pass-wrap {
+      position: relative
+    }
+
+    .pass-toggle {
+      position: absolute;
+      left: 11px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: none;
+      border: none;
+      color: var(--text3);
+      cursor: pointer;
+      font-size: 15px;
+      padding: 4px
+    }
+
+    .pass-strength {
+      height: 3px;
+      background: var(--surface3);
+      border-radius: 2px;
+      margin-top: 5px;
+      overflow: hidden
+    }
+
+    .pass-strength-fill {
+      height: 100%;
+      border-radius: 2px;
+      transition: all .3s;
+      width: 0
+    }
+
+    .btn-auth {
+      width: 100%;
+      padding: 13px;
+      border: none;
+      border-radius: var(--rs);
+      background: var(--accent);
+      color: var(--bg);
+      font-family: 'Cairo', sans-serif;
+      font-size: 15px;
+      font-weight: 900;
+      cursor: pointer;
+      transition: all .2s;
+      margin-top: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 46px
+    }
+
+    .btn-auth:hover {
+      filter: brightness(1.1);
+      transform: translateY(-1px)
+    }
+
+    .btn-auth:disabled {
+      opacity: .6;
+      transform: none;
+      cursor: not-allowed
+    }
+
+    .auth-err {
+      background: rgba(240, 96, 96, .1);
+      border: 1px solid rgba(240, 96, 96, .3);
+      color: var(--err);
+      padding: 9px 13px;
+      border-radius: var(--rs);
+      font-size: 13px;
+      margin-bottom: 13px;
+      display: none
+    }
+
+    .auth-err.show {
+      display: block
+    }
+
+    .firebase-note {
+      background: rgba(96, 212, 240, .05);
+      border: 1px solid rgba(96, 212, 240, .15);
+      border-radius: var(--rs);
+      padding: 10px 13px;
+      margin-top: 14px;
+      font-size: 11px;
+      color: var(--text2);
+      line-height: 1.6;
+      text-align: center
+    }
+
+    .firebase-note strong {
+      color: var(--accent2)
+    }
+
+    /* APP */
+    #app {
+      position: relative;
+      z-index: 1;
+      max-width: 480px;
+      margin: 0 auto;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column
+    }
+
+    .header {
+      padding: 18px 20px 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between
+    }
+
+    .logo {
+      font-size: 22px;
+      font-weight: 900;
+      letter-spacing: -1px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent
+    }
+
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 8px
+    }
+
+    .user-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--surface2);
+      border: 1px solid var(--surface3);
+      padding: 5px 11px;
+      border-radius: 30px;
+      font-size: 12px;
+      color: var(--text2);
+      cursor: pointer;
+      transition: all .2s
+    }
+
+    .user-badge:hover {
+      border-color: var(--accent3);
+      color: var(--accent3)
+    }
+
+    .user-avatar {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      font-weight: 900;
+      color: var(--bg)
+    }
+
+    .date-badge {
+      background: var(--surface2);
+      border: 1px solid var(--surface3);
+      padding: 5px 11px;
+      border-radius: 30px;
+      font-size: 12px;
+      color: var(--text2);
+      cursor: pointer;
+      transition: all .2s
+    }
+
+    .date-badge:hover {
+      border-color: var(--accent);
+      color: var(--accent)
+    }
+
+    .nav {
+      display: flex;
+      gap: 4px;
+      padding: 12px 20px 0
+    }
+
+    .nav-btn {
+      flex: 1;
+      padding: 8px 3px;
+      border-radius: var(--rs);
+      border: none;
+      background: var(--surface2);
+      color: var(--text2);
+      font-family: 'Cairo', sans-serif;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all .2s;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px
+    }
+
+    .nav-btn .ni {
+      font-size: 16px
+    }
+
+    .nav-btn.active {
+      background: var(--accent);
+      color: var(--bg)
+    }
+
+    .nav-btn:hover:not(.active) {
+      background: var(--surface3);
+      color: var(--text)
+    }
+
+    .content {
+      flex: 1;
+      padding: 13px 20px 90px;
+      overflow-y: auto
+    }
+
+    .page {
+      display: none
+    }
+
+    .page.active {
+      display: block
+    }
+
+    .sec-title {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 2.5px;
+      color: var(--text3);
+      text-transform: uppercase;
+      margin: 16px 0 7px
+    }
+
+    /* RING */
+    .ring-card {
+      background: var(--surface);
+      border: 1px solid var(--surface3);
+      border-radius: var(--r);
+      padding: 20px;
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      margin-bottom: 9px
+    }
+
+    .ring-wrap {
+      position: relative;
+      flex-shrink: 0
+    }
+
+    .ring-svg {
+      width: 106px;
+      height: 106px;
+      transform: rotate(-90deg)
+    }
+
+    .ring-bg {
+      fill: none;
+      stroke: var(--surface3);
+      stroke-width: 9
+    }
+
+    .ring-fill {
+      fill: none;
+      stroke: var(--accent);
+      stroke-width: 9;
+      stroke-linecap: round;
+      transition: stroke-dashoffset .7s cubic-bezier(.4, 0, .2, 1)
+    }
+
+    .ring-center {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center
+    }
+
+    .ring-cal {
+      font-size: 20px;
+      font-weight: 900;
+      color: var(--accent)
+    }
+
+    .ring-lbl {
+      font-size: 9px;
+      color: var(--text3);
+      font-weight: 700;
+      letter-spacing: 1px
+    }
+
+    .ring-remaining {
+      font-size: 10px;
+      color: var(--text3);
+      margin-top: 2px
+    }
+
+    .ring-info {
+      flex: 1
+    }
+
+    .goal-line {
+      font-size: 12px;
+      color: var(--text2);
+      margin-bottom: 9px
+    }
+
+    .goal-line strong {
+      color: var(--text)
+    }
+
+    .macro-list {
+      display: flex;
+      flex-direction: column;
+      gap: 5px
+    }
+
+    .macro-item {
+      display: flex;
+      align-items: center;
+      gap: 7px
+    }
+
+    .mdot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      flex-shrink: 0
+    }
+
+    .mname {
+      font-size: 11px;
+      color: var(--text2);
+      flex: 1
+    }
+
+    .mval {
+      font-size: 11px;
+      font-weight: 700
+    }
+
+    .mbar {
+      height: 3px;
+      background: var(--surface3);
+      border-radius: 2px;
+      margin: -3px 0 3px 14px
+    }
+
+    .mbar-fill {
+      height: 100%;
+      border-radius: 2px;
+      transition: width .6s
+    }
+
+    /* MEALS */
+    .meal-sec {
+      background: var(--surface);
+      border: 1px solid var(--surface3);
+      border-radius: var(--r);
+      overflow: hidden;
+      margin-bottom: 7px
+    }
+
+    .meal-head {
+      padding: 12px 14px;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      cursor: pointer;
+      user-select: none
+    }
+
+    .meal-icon {
+      font-size: 19px
+    }
+
+    .meal-title {
+      font-weight: 700;
+      font-size: 13px;
+      flex: 1
+    }
+
+    .meal-kcal {
+      font-size: 12px;
+      color: var(--accent);
+      font-weight: 700
+    }
+
+    .meal-chev {
+      color: var(--text3);
+      transition: transform .2s;
+      font-size: 11px
+    }
+
+    .meal-sec.open .meal-chev {
+      transform: rotate(180deg)
+    }
+
+    .meal-items {
+      border-top: 1px solid var(--surface3)
+    }
+
+    .meal-empty {
+      padding: 10px 14px;
+      font-size: 12px;
+      color: var(--text3);
+      font-style: italic
+    }
+
+    .meal-item {
+      padding: 8px 14px;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      border-bottom: 1px solid rgba(255, 255, 255, .02);
+      animation: fadeIn .2s
+    }
+
+    @keyframes fadeIn {
+      from {
+        opacity: 0;
+        transform: translateX(6px)
+      }
+
+      to {
+        opacity: 1;
+        transform: translateX(0)
+      }
+    }
+
+    .meal-item:last-child {
+      border-bottom: none
+    }
+
+    .mi-name {
+      flex: 1;
+      font-size: 13px
+    }
+
+    .mi-g {
+      font-size: 11px;
+      color: var(--text3)
+    }
+
+    .mi-cal {
+      font-size: 12px;
+      color: var(--accent);
+      font-weight: 600;
+      min-width: 48px;
+      text-align: left
+    }
+
+    .mi-del {
+      background: none;
+      border: none;
+      color: var(--text3);
+      cursor: pointer;
+      font-size: 13px;
+      padding: 3px 5px;
+      border-radius: 6px;
+      transition: all .15s
+    }
+
+    .mi-del:hover {
+      color: var(--accent3);
+      background: rgba(240, 96, 184, .08)
+    }
+
+    .add-food-row {
+      padding: 9px 14px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      border-top: 1px solid var(--surface3);
+      transition: background .15s
+    }
+
+    .add-food-row:hover {
+      background: rgba(184, 240, 96, .04)
+    }
+
+    .save-meal-row {
+      padding: 8px 14px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--accent2);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background .15s
+    }
+
+    .save-meal-row:hover {
+      background: rgba(96, 212, 240, .04)
+    }
+
+    /* BTNS */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 10px 16px;
+      border-radius: var(--rs);
+      border: none;
+      font-family: 'Cairo', sans-serif;
+      font-weight: 700;
+      font-size: 13px;
+      cursor: pointer;
+      transition: all .2s
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: var(--bg)
+    }
+
+    .btn-primary:hover {
+      filter: brightness(1.1)
+    }
+
+    .btn-ghost {
+      background: var(--surface2);
+      color: var(--text2);
+      border: 1px solid var(--surface3)
+    }
+
+    .btn-ghost:hover {
+      border-color: var(--accent2);
+      color: var(--accent2)
+    }
+
+    .btn-full {
+      width: 100%;
+      justify-content: center
+    }
+
+    .btn-danger {
+      background: rgba(240, 96, 96, .1);
+      color: var(--err);
+      border: 1px solid rgba(240, 96, 96, .2)
+    }
+
+    .btn-danger:hover {
+      background: rgba(240, 96, 96, .2)
+    }
+
+    /* MODALS */
+    .overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, .75);
+      z-index: 100;
+      display: flex;
+      align-items: flex-end;
+      justify-content: center;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .25s
+    }
+
+    .overlay.open {
+      opacity: 1;
+      pointer-events: all
+    }
+
+    .modal {
+      background: var(--surface);
+      border-radius: 20px 20px 0 0;
+      width: 100%;
+      max-width: 480px;
+      padding: 20px;
+      transform: translateY(28px);
+      transition: transform .25s;
+      max-height: 88vh;
+      overflow-y: auto
+    }
+
+    .overlay.open .modal {
+      transform: translateY(0)
+    }
+
+    .modal-bar {
+      width: 36px;
+      height: 3px;
+      background: var(--surface4);
+      border-radius: 2px;
+      margin: 0 auto 15px
+    }
+
+    .modal-title {
+      font-size: 16px;
+      font-weight: 700;
+      margin-bottom: 3px
+    }
+
+    .modal-sub {
+      font-size: 12px;
+      color: var(--text2);
+      margin-bottom: 16px
+    }
+
+    .mclose {
+      float: left;
+      background: none;
+      border: none;
+      color: var(--text2);
+      font-size: 19px;
+      cursor: pointer
+    }
+
+    .mclose:hover {
+      color: var(--text)
+    }
+
+    /* TABS */
+    .tab-bar {
+      display: flex;
+      gap: 4px;
+      background: var(--surface2);
+      padding: 4px;
+      border-radius: var(--rs);
+      margin-bottom: 13px
+    }
+
+    .tab-btn {
+      flex: 1;
+      padding: 8px;
+      border-radius: 8px;
+      border: none;
+      background: transparent;
+      color: var(--text2);
+      font-family: 'Cairo', sans-serif;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all .15s
+    }
+
+    .tab-btn.active {
+      background: var(--accent);
+      color: var(--bg)
+    }
+
+    .tab-content {
+      display: none
+    }
+
+    .tab-content.active {
+      display: block
+    }
+
+    /* AI */
+    .ai-result {
+      background: var(--surface2);
+      border: 1px solid var(--surface3);
+      border-radius: var(--rs);
+      padding: 12px;
+      margin: 10px 0;
+      display: none
+    }
+
+    .ai-result.show {
+      display: block
+    }
+
+    .ai-result-title {
+      font-size: 11px;
+      color: var(--accent);
+      font-weight: 700;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 5px
+    }
+
+    .ai-food-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 5px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, .03)
+    }
+
+    .ai-food-item:last-child {
+      border-bottom: none
+    }
+
+    .ai-fname {
+      font-size: 13px
+    }
+
+    .ai-fgrams {
+      font-size: 11px;
+      color: var(--text3)
+    }
+
+    .ai-macros {
+      display: flex;
+      gap: 7px;
+      font-size: 11px
+    }
+
+    .ai-macros .c {
+      color: var(--cal);
+      font-weight: 700
+    }
+
+    .ai-macros .p {
+      color: var(--protein)
+    }
+
+    .ai-macros .f {
+      color: var(--fat)
+    }
+
+    .ai-macros .cb {
+      color: var(--carbs)
+    }
+
+    .loading {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--accent2);
+      font-size: 13px;
+      padding: 10px 0
+    }
+
+    .spinner {
+      width: 15px;
+      height: 15px;
+      border: 2px solid var(--surface3);
+      border-top-color: var(--accent2);
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+      flex-shrink: 0
+    }
+
+    /* SAVED */
+    .saved-item {
+      background: var(--surface2);
+      border: 1px solid var(--surface3);
+      border-radius: var(--rs);
+      padding: 10px 12px;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      cursor: pointer;
+      transition: all .15s
+    }
+
+    .saved-item:hover {
+      border-color: var(--accent2)
+    }
+
+    .si-name {
+      flex: 1;
+      font-size: 13px;
+      font-weight: 600
+    }
+
+    .si-cal {
+      font-size: 12px;
+      color: var(--accent);
+      font-weight: 700
+    }
+
+    .si-sub {
+      font-size: 11px;
+      color: var(--text3)
+    }
+
+    /* SCAN */
+    .scan-zone {
+      background: var(--surface);
+      border: 2px dashed var(--surface3);
+      border-radius: var(--r);
+      padding: 34px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: all .2s;
+      margin-bottom: 9px
+    }
+
+    .scan-zone:hover {
+      border-color: var(--accent2);
+      background: rgba(96, 212, 240, .02)
+    }
+
+    .scan-icon {
+      font-size: 42px;
+      margin-bottom: 9px
+    }
+
+    .scan-title {
+      font-size: 14px;
+      font-weight: 700;
+      margin-bottom: 4px
+    }
+
+    .scan-sub {
+      font-size: 12px;
+      color: var(--text2)
+    }
+
+    .product-card {
+      background: var(--surface);
+      border: 1px solid var(--accent2);
+      border-radius: var(--r);
+      padding: 14px;
+      margin-bottom: 9px;
+      display: none;
+      animation: fadeIn .3s
+    }
+
+    .product-card.show {
+      display: block
+    }
+
+    .prod-name {
+      font-size: 15px;
+      font-weight: 700;
+      margin-bottom: 2px
+    }
+
+    .prod-brand {
+      font-size: 11px;
+      color: var(--text3);
+      margin-bottom: 12px
+    }
+
+    .shared-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: rgba(96, 212, 240, .1);
+      border: 1px solid rgba(96, 212, 240, .2);
+      color: var(--accent2);
+      padding: 3px 9px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 600;
+      margin-bottom: 11px
+    }
+
+    .nutr-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px
+    }
+
+    .nutr-item {
+      background: var(--surface2);
+      border-radius: 10px;
+      padding: 8px 10px
+    }
+
+    .nutr-lbl {
+      font-size: 10px;
+      color: var(--text3)
+    }
+
+    .nutr-val {
+      font-size: 16px;
+      font-weight: 900
+    }
+
+    .nutr-unit {
+      font-size: 10px;
+      color: var(--text2)
+    }
+
+    /* HISTORY */
+    .day-card {
+      background: var(--surface);
+      border: 1px solid var(--surface3);
+      border-radius: var(--r);
+      padding: 14px;
+      margin-bottom: 7px;
+      cursor: pointer;
+      transition: all .15s
+    }
+
+    .day-card:hover {
+      border-color: var(--surface4)
+    }
+
+    .day-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 7px
+    }
+
+    .day-date {
+      font-weight: 700;
+      font-size: 13px
+    }
+
+    .day-cal-badge {
+      background: rgba(184, 240, 96, .1);
+      color: var(--accent);
+      padding: 3px 9px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 700
+    }
+
+    .day-meals-list {
+      font-size: 11px;
+      color: var(--text3);
+      margin-bottom: 6px
+    }
+
+    .day-macros {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap
+    }
+
+    .dm {
+      font-size: 11px;
+      color: var(--text2)
+    }
+
+    .dm strong {
+      font-weight: 700
+    }
+
+    /* PROFILE */
+    .profile-card {
+      background: var(--surface);
+      border: 1px solid var(--surface3);
+      border-radius: var(--r);
+      padding: 20px;
+      margin-bottom: 9px;
+      text-align: center
+    }
+
+    .profile-ava {
+      width: 60px;
+      height: 60px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 26px;
+      font-weight: 900;
+      color: var(--bg);
+      margin: 0 auto 11px
+    }
+
+    .profile-name {
+      font-size: 17px;
+      font-weight: 700;
+      margin-bottom: 3px
+    }
+
+    .profile-email {
+      font-size: 12px;
+      color: var(--text2)
+    }
+
+    /* GOALS */
+    .goal-card {
+      background: var(--surface);
+      border: 1px solid var(--surface3);
+      border-radius: var(--r);
+      padding: 18px;
+      margin-bottom: 9px
+    }
+
+    .goal-ttl {
+      font-size: 13px;
+      font-weight: 700;
+      margin-bottom: 13px;
+      color: var(--text2)
+    }
+
+    .slider-wrap {
+      margin-bottom: 14px
+    }
+
+    .slider-head {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 5px
+    }
+
+    .slider-name {
+      font-size: 12px;
+      font-weight: 600
+    }
+
+    .slider-val {
+      font-size: 12px;
+      font-weight: 900
+    }
+
+    input[type=range] {
+      width: 100%;
+      accent-color: var(--accent);
+      background: var(--surface3);
+      height: 4px;
+      border-radius: 2px
+    }
+
+    /* FORM */
+    .fgroup {
+      margin-bottom: 12px
+    }
+
+    .flabel {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text2);
+      margin-bottom: 5px;
+      display: block
+    }
+
+    .finput {
+      width: 100%;
+      background: var(--surface2);
+      border: 1.5px solid var(--surface3);
+      color: var(--text);
+      font-family: 'Cairo', sans-serif;
+      font-size: 14px;
+      padding: 10px 12px;
+      border-radius: var(--rs);
+      outline: none;
+      transition: border-color .2s
+    }
+
+    .finput:focus {
+      border-color: var(--accent)
+    }
+
+    .frow {
+      display: flex;
+      gap: 8px
+    }
+
+    .frow .fgroup {
+      flex: 1
+    }
+
+    /* TOAST */
+    .toast {
+      position: fixed;
+      bottom: 84px;
+      left: 50%;
+      transform: translateX(-50%) translateY(14px);
+      background: var(--surface3);
+      color: var(--text);
+      padding: 8px 16px;
+      border-radius: 30px;
+      font-size: 13px;
+      font-weight: 600;
+      z-index: 200;
+      opacity: 0;
+      transition: all .3s;
+      white-space: nowrap;
+      border: 1px solid var(--surface4)
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0)
+    }
+
+    /* EMPTY */
+    .empty {
+      text-align: center;
+      padding: 34px 20px;
+      color: var(--text3)
+    }
+
+    .empty-icon {
+      font-size: 42px;
+      margin-bottom: 7px
+    }
+
+    .empty-text {
+      font-size: 13px;
+      line-height: 1.6
+    }
+
+    ::-webkit-scrollbar {
+      width: 3px
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: var(--surface3);
+      border-radius: 2px
+    }
+  </style>
+</head>
+
+<body>
+
+  <!-- LOADING -->
+  <div class="screen" id="loadingScreen">
+    <div class="loading-logo">كالوري.</div>
+    <div class="loading-spin"></div>
+  </div>
+
+  <!-- AUTH -->
+  <div class="screen hide" id="authScreen">
+    <div class="auth-wrap">
+      <div class="auth-logo">
+        <div class="auth-logo-text">كالوري.</div>
+        <div class="auth-logo-sub">تتبع تغذيتك اليومية بذكاء</div>
+      </div>
+      <div class="auth-card">
+        <div class="auth-tabs">
+          <button class="auth-tab active" onclick="switchAuthTab('login')">تسجيل الدخول</button>
+          <button class="auth-tab" onclick="switchAuthTab('register')">حساب جديد</button>
+        </div>
+        <div id="authErr" class="auth-err"></div>
+
+        <!-- LOGIN -->
+        <div id="loginForm">
+          <div class="form-group">
+            <label class="form-label">الإيميل</label>
+            <input class="form-input" id="loginEmail" type="email" placeholder="example@gmail.com" autocomplete="email"
+              oninput="clearAuthErr()">
+          </div>
+          <div class="form-group">
+            <label class="form-label">كلمة المرور</label>
+            <div class="pass-wrap">
+              <input class="form-input" id="loginPass" type="password" placeholder="••••••••"
+                autocomplete="current-password" oninput="clearAuthErr()" onkeydown="if(event.key==='Enter')doLogin()">
+              <button class="pass-toggle" type="button" onclick="togglePass('loginPass',this)">👁</button>
+            </div>
+          </div>
+          <button class="btn-auth" id="loginBtn" onclick="doLogin()">دخول →</button>
+        </div>
+
+        <!-- REGISTER -->
+        <div id="registerForm" style="display:none">
+          <div class="form-group">
+            <label class="form-label">الاسم</label>
+            <input class="form-input" id="regName" type="text" placeholder="الاسم الكامل" oninput="validateName()">
+            <div class="field-hint" id="regNameHint"></div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">الإيميل</label>
+            <input class="form-input" id="regEmail" type="email" placeholder="example@gmail.com"
+              oninput="validateEmailField()">
+            <div class="field-hint" id="regEmailHint"></div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">كلمة المرور</label>
+            <div class="pass-wrap">
+              <input class="form-input" id="regPass" type="password" placeholder="8 أحرف على الأقل"
+                autocomplete="new-password" oninput="validatePass()">
+              <button class="pass-toggle" type="button" onclick="togglePass('regPass',this)">👁</button>
+            </div>
+            <div class="pass-strength">
+              <div class="pass-strength-fill" id="passStrengthBar"></div>
+            </div>
+            <div class="field-hint" id="regPassHint"></div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">تأكيد كلمة المرور</label>
+            <div class="pass-wrap">
+              <input class="form-input" id="regPass2" type="password" placeholder="أعد كتابة كلمة المرور"
+                autocomplete="new-password" oninput="validatePass2()">
+              <button class="pass-toggle" type="button" onclick="togglePass('regPass2',this)">👁</button>
+            </div>
+            <div class="field-hint" id="regPass2Hint"></div>
+          </div>
+          <button class="btn-auth" id="regBtn" onclick="doRegister()">إنشاء الحساب →</button>
+        </div>
+
+        <div class="firebase-note">
+          🔥 مدعوم بـ <strong>Firebase</strong> — بياناتك محفوظة على السحابة من أي جهاز
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- APP -->
+  <div class="screen hide" id="appScreen">
+    <div id="app">
+      <div class="header">
+        <div class="logo">كالوري.</div>
+        <div class="header-right">
+          <div class="date-badge" id="dateBadge" onclick="openModal('dateModal')">📅 اليوم</div>
+          <div class="user-badge" onclick="showPage('profile',document.querySelectorAll('.nav-btn')[4])">
+            <div class="user-avatar" id="userAva">؟</div>
+            <span id="userNameBadge">—</span>
+          </div>
+        </div>
+      </div>
+      <div class="nav">
+        <button class="nav-btn active" onclick="showPage('home',this)"><span class="ni">🏠</span>اليوم</button>
+        <button class="nav-btn" onclick="showPage('scan',this)"><span class="ni">📷</span>مسح</button>
+        <button class="nav-btn" onclick="showPage('saved',this)"><span class="ni">⭐</span>محفوظة</button>
+        <button class="nav-btn" onclick="showPage('history',this)"><span class="ni">📊</span>سجل</button>
+        <button class="nav-btn" onclick="showPage('profile',this)"><span class="ni">👤</span>حسابي</button>
+      </div>
+      <div class="content">
+
+        <!-- HOME -->
+        <div class="page active" id="page-home">
+          <div class="sec-title">ملخص اليوم</div>
+          <div class="ring-card">
+            <div class="ring-wrap">
+              <svg class="ring-svg" viewBox="0 0 100 100">
+                <circle class="ring-bg" cx="50" cy="50" r="40" />
+                <circle class="ring-fill" id="ringFill" cx="50" cy="50" r="40" stroke-dasharray="251.2"
+                  stroke-dashoffset="251.2" />
+              </svg>
+              <div class="ring-center">
+                <div class="ring-cal" id="ringCal">0</div>
+                <div class="ring-lbl">KCAL</div>
+                <div class="ring-remaining" id="remainingTxt"></div>
+              </div>
+            </div>
+            <div class="ring-info">
+              <div class="goal-line">الهدف: <strong id="goalTxt">2000</strong> سعرة</div>
+              <div class="macro-list" id="macroList"></div>
+            </div>
+          </div>
+          <div class="sec-title">الوجبات</div>
+          <div id="mealSections"></div>
+          <button class="btn btn-ghost btn-full" style="margin-top:8px" onclick="addMealSection()">＋ وجبة جديدة</button>
+        </div>
+
+        <!-- SCAN -->
+        <div class="page" id="page-scan">
+          <div class="sec-title">إضافة منتج</div>
+          <div class="scan-zone" onclick="document.getElementById('barcodeInput').click()">
+            <div class="scan-icon">📦</div>
+            <div class="scan-title">مسح الباركود</div>
+            <div class="scan-sub">صوّر الباركود — إذا موجود في Firebase يطلع مباشرة</div>
+          </div>
+          <div class="scan-zone" onclick="document.getElementById('photoInput').click()">
+            <div class="scan-icon">🔍</div>
+            <div class="scan-title">تصوير الجدول الغذائي</div>
+            <div class="scan-sub">صوّر جدول القيم الغذائية وسيقرأه الذكاء الاصطناعي</div>
+          </div>
+          <input type="file" id="barcodeInput" accept="image/*" capture="environment" style="display:none"
+            onchange="handleBarcodePhoto(event)">
+          <input type="file" id="photoInput" accept="image/*" capture="environment" style="display:none"
+            onchange="handleNutritionPhoto(event)">
+          <div class="product-card" id="productCard">
+            <div class="shared-badge">🌍 منتج مشترك — مرئي لجميع المستخدمين</div>
+            <div class="prod-name" id="prodName">—</div>
+            <div class="prod-brand" id="prodBrand"></div>
+            <div class="nutr-grid" id="nutrGrid"></div>
+            <div style="margin-top:12px;display:flex;gap:7px">
+              <button class="btn btn-primary" style="flex:1" onclick="addProductToMeal()">➕ إضافة للوجبة</button>
+              <button class="btn btn-ghost" onclick="saveSharedProduct()">☁️ حفظ</button>
+            </div>
+          </div>
+          <div class="sec-title">منتجات مشتركة في Firebase</div>
+          <div id="sharedProductsList"></div>
+        </div>
+
+        <!-- SAVED -->
+        <div class="page" id="page-saved">
+          <div class="sec-title">وجباتي المحفوظة</div>
+          <div id="savedMealsList"></div>
+          <div class="empty" id="savedEmpty" style="display:none">
+            <div class="empty-icon">⭐</div>
+            <div class="empty-text">لا توجد وجبات محفوظة بعد<br>احفظ وجبة من صفحة اليوم</div>
+          </div>
+        </div>
+
+        <!-- HISTORY -->
+        <div class="page" id="page-history">
+          <div class="sec-title">سجل الأيام</div>
+          <div id="historyList"></div>
+        </div>
+
+        <!-- PROFILE -->
+        <div class="page" id="page-profile">
+          <div class="sec-title">حسابي</div>
+          <div class="profile-card">
+            <div class="profile-ava" id="profileAva">؟</div>
+            <div class="profile-name" id="profileName">—</div>
+            <div class="profile-email" id="profileEmail">—</div>
+          </div>
+          <div class="goal-card">
+            <div class="goal-ttl">🎯 الأهداف اليومية</div>
+            <div class="slider-wrap">
+              <div class="slider-head"><span class="slider-name" style="color:var(--cal)">🔥 السعرات</span><span
+                  class="slider-val" id="calGV" style="color:var(--cal)">2000</span></div>
+              <input type="range" min="1000" max="5000" step="50" id="calGS" value="2000" oninput="ugGoal('cal')">
+            </div>
+            <div class="slider-wrap">
+              <div class="slider-head"><span class="slider-name" style="color:var(--protein)">🥩 بروتين (g)</span><span
+                  class="slider-val" id="proGV" style="color:var(--protein)">150</span></div>
+              <input type="range" min="50" max="300" step="5" id="proGS" value="150" oninput="ugGoal('pro')">
+            </div>
+            <div class="slider-wrap">
+              <div class="slider-head"><span class="slider-name" style="color:var(--carbs)">🍞 كربوهيدرات
+                  (g)</span><span class="slider-val" id="carbGV" style="color:var(--carbs)">200</span></div>
+              <input type="range" min="50" max="500" step="5" id="carbGS" value="200" oninput="ugGoal('carb')">
+            </div>
+            <div class="slider-wrap">
+              <div class="slider-head"><span class="slider-name" style="color:var(--fat)">🧈 دهون (g)</span><span
+                  class="slider-val" id="fatGV" style="color:var(--fat)">65</span></div>
+              <input type="range" min="20" max="200" step="5" id="fatGS" value="65" oninput="ugGoal('fat')">
+            </div>
+            <button class="btn btn-primary btn-full" onclick="saveGoals()">💾 حفظ الأهداف</button>
+          </div>
+          <button class="btn btn-danger btn-full" style="margin-top:8px" onclick="doLogout()">تسجيل الخروج</button>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- ADD FOOD MODAL -->
+  <div class="overlay" id="addFoodModal">
+    <div class="modal">
+      <div class="modal-bar"></div>
+      <button class="mclose" onclick="closeModal('addFoodModal')">✕</button>
+      <div class="modal-title">إضافة طعام</div>
+      <div class="modal-sub" id="addFoodMealLbl">الإفطار</div>
+      <div class="tab-bar">
+        <button class="tab-btn active" onclick="switchTab('ai')">🤖 ذكاء اصطناعي</button>
+        <button class="tab-btn" onclick="switchTab('manual')">✏️ يدوي</button>
+        <button class="tab-btn" onclick="switchTab('sfood')">⭐ محفوظة</button>
+      </div>
+      <div class="tab-content active" id="tab-ai">
+        <div class="fgroup">
+          <label class="flabel">اكتب اللي أكلته</label>
+          <input class="finput" id="aiInput" placeholder="مثال: ٣ بيضات مسلوقة وخبز توست وعصير"
+            onkeydown="if(event.key==='Enter')analyzeFood()">
+        </div>
+        <button class="btn btn-primary btn-full" onclick="analyzeFood()" id="aiBtn">🔍 تحليل</button>
+        <div class="loading" id="aiLoading" style="display:none">
+          <div class="spinner"></div>جاري التحليل...
+        </div>
+        <div class="ai-result" id="aiResult"></div>
+      </div>
+      <div class="tab-content" id="tab-manual">
+        <div class="fgroup"><label class="flabel">اسم الطعام</label><input class="finput" id="mName"
+            placeholder="دجاج مشوي"></div>
+        <div class="frow">
+          <div class="fgroup"><label class="flabel">الكمية (g)</label><input class="finput" id="mGrams" type="number"
+              placeholder="100"></div>
+          <div class="fgroup"><label class="flabel">سعرات</label><input class="finput" id="mCal" type="number"
+              placeholder="0"></div>
+        </div>
+        <div class="frow">
+          <div class="fgroup"><label class="flabel">بروتين</label><input class="finput" id="mPro" type="number"
+              placeholder="0"></div>
+          <div class="fgroup"><label class="flabel">كربو</label><input class="finput" id="mCarb" type="number"
+              placeholder="0"></div>
+          <div class="fgroup"><label class="flabel">دهون</label><input class="finput" id="mFat" type="number"
+              placeholder="0"></div>
+        </div>
+        <button class="btn btn-primary btn-full" onclick="addManualFood()">➕ إضافة</button>
+      </div>
+      <div class="tab-content" id="tab-sfood">
+        <div id="savedFoodsModal"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- DATE MODAL -->
+  <div class="overlay" id="dateModal">
+    <div class="modal">
+      <div class="modal-bar"></div>
+      <button class="mclose" onclick="closeModal('dateModal')">✕</button>
+      <div class="modal-title">اختر يوم</div>
+      <input class="finput" type="date" id="dateInput" oninput="switchDate(this.value)">
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <!--
+╔══════════════════════════════════════════════════════════════╗
+║           🔥 دليل إعداد Firebase — اتبع هذه الخطوات         ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  1. افتح: https://console.firebase.google.com               ║
+║  2. "Create a project" → اختر اسم (مثلاً: kalori-app)       ║
+║  3. من القائمة الجانبية: Build → Authentication             ║
+║     → Get started → Email/Password → Enable → Save          ║
+║  4. من القائمة الجانبية: Build → Firestore Database         ║
+║     → Create database → Start in test mode → Next → Enable  ║
+║  5. Project Settings (⚙️) → Your apps → "</>" (Web)         ║
+║     → اكتب اسم التطبيق → Register app                       ║
+║     → انسخ الـ firebaseConfig وضعه أعلى هذا الملف           ║
+║                                                              ║
+║  6. في Firestore → Rules → ضع هذه القواعد:                  ║
+║                                                              ║
+║  rules_version = '2';                                        ║
+║  service cloud.firestore {                                   ║
+║    match /databases/{database}/documents {                   ║
+║      // منتجات مشتركة — الكل يقرأ، المسجلون يكتبون         ║
+║      match /products/{barcode} {                             ║
+║        allow read: if true;                                  ║
+║        allow write: if request.auth != null;                 ║
+║      }                                                       ║
+║      // داتا كل يوزر خاصة فيه فقط                          ║
+║      match /users/{userId}/data/{doc} {                      ║
+║        allow read, write: if request.auth.uid == userId;     ║
+║      }                                                       ║
+║    }                                                         ║
+║  }                                                           ║
+║                                                              ║
+║  7. ارفع الملف على GitHub Pages أو أي hosting               ║
+║     وشاركه مع أي شخص!                                       ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+-->
+</body>
+
+</html>
